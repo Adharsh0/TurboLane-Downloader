@@ -1,215 +1,31 @@
-
-# """
-# downloader.py
-# MultiStreamDownloader — parallel HTTP downloader with optional RL optimization
-# """
-
-# import os
-# import requests
-# import threading
-# from urllib.parse import urlparse, unquote
-# import time
-# import logging
-
-# from config import (
-#     DEFAULT_NUM_STREAMS, MIN_STREAMS, MAX_STREAMS,
-#     MIN_CHUNK_SIZE, BUFFER_SIZE,
-#     CONNECTION_TIMEOUT, READ_TIMEOUT,
-#     RL_MONITORING_INTERVAL, DOWNLOAD_FOLDER,
-# )
-# from adapter import adapter
-
-# logger = logging.getLogger(__name__)
-
-
-# class MultiStreamDownloader:
-
-#     def __init__(self, url, num_streams=DEFAULT_NUM_STREAMS, progress_callback=None, use_rl=False):
-#         self.url = url
-#         self.num_streams = min(max(num_streams, MIN_STREAMS), MAX_STREAMS)
-#         self.use_rl = use_rl
-#         self.progress_callback = progress_callback
-
-#         self.current_stream_count = self.num_streams
-#         self.file_size = 0
-#         self.downloaded_bytes = 0
-#         self.is_downloading = False
-#         self.chunks = []
-#         self.threads = []
-#         self.temp_files = []
-#         self.lock = threading.Lock()
-#         self.start_time = None
-
-#         self._last_mi_time = time.time()
-#         self._last_mi_bytes = 0
-
-#         if self.use_rl:
-#             self.current_stream_count = adapter.current_connections
-#             logger.info(f"RL enabled. Initial streams: {self.current_stream_count}")
-
-#     # ------------------------------------------------------------
-#     # CRITICAL FIX → expose current stream count to backend
-#     # ------------------------------------------------------------
-#     def get_current_streams(self):
-#         return self.current_stream_count
-
-#     # ------------------------------------------------------------
-#     # Basic network stats
-#     # ------------------------------------------------------------
-#     def calculate_throughput(self):
-#         now = time.time()
-#         elapsed = now - self._last_mi_time
-#         if elapsed <= 0:
-#             return 0
-#         bytes_delta = self.downloaded_bytes - self._last_mi_bytes
-#         return (bytes_delta * 8) / (elapsed * 1024 * 1024)
-
-#     def get_speed(self):
-#         return self.calculate_throughput() / 8
-
-#     # ------------------------------------------------------------
-#     # RL monitoring interval
-#     # ------------------------------------------------------------
-#     def _run_monitoring_interval(self):
-#         if not self.use_rl:
-#             return
-
-#         if time.time() - self._last_mi_time < RL_MONITORING_INTERVAL:
-#             return
-
-#         throughput = self.calculate_throughput()
-
-#         if throughput > 0:
-#             adapter.learn(throughput, 100, 0.1)
-
-#         new_streams = adapter.decide(throughput, 100, 0.1)
-
-#         if new_streams != self.current_stream_count:
-#             logger.info(f"Streams changed {self.current_stream_count} → {new_streams}")
-#             self.current_stream_count = new_streams
-
-#         self._last_mi_bytes = self.downloaded_bytes
-#         self._last_mi_time = time.time()
-
-#     # ------------------------------------------------------------
-#     # Chunk handling
-#     # ------------------------------------------------------------
-#     def _get_filename(self):
-#         path = urlparse(self.url).path
-#         filename = unquote(os.path.basename(path))
-#         return filename or "downloaded_file"
-
-#     def check_download_support(self):
-#         response = requests.head(self.url, timeout=CONNECTION_TIMEOUT, allow_redirects=True)
-#         supports_ranges = response.headers.get("Accept-Ranges") == "bytes"
-#         size = int(response.headers.get("Content-Length", 0))
-#         return supports_ranges, size, self._get_filename()
-
-#     def _calculate_chunks(self, size, streams):
-#         chunk_size = size // streams
-#         chunks = []
-#         for i in range(streams):
-#             start = i * chunk_size
-#             end = size - 1 if i == streams - 1 else (i + 1) * chunk_size - 1
-#             chunks.append((start, end))
-#         return chunks
-
-#     def _download_chunk(self, chunk_id, start, end, temp_file):
-#         headers = {"Range": f"bytes={start}-{end}"}
-#         try:
-#             with requests.get(self.url, headers=headers, stream=True,
-#                               timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT)) as r:
-#                 with open(temp_file, "wb") as f:
-#                     for data in r.iter_content(chunk_size=BUFFER_SIZE):
-#                         if not self.is_downloading:
-#                             break
-#                         f.write(data)
-#                         with self.lock:
-#                             self.downloaded_bytes += len(data)
-#         except Exception as e:
-#             logger.error(f"Chunk {chunk_id} failed: {e}")
-
-#     # ------------------------------------------------------------
-#     # Download logic
-#     # ------------------------------------------------------------
-#     def download(self):
-#         supports, size, filename = self.check_download_support()
-#         self.file_size = size
-#         output = os.path.join(DOWNLOAD_FOLDER, filename)
-#         os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-
-#         if not supports:
-#             self.num_streams = 1
-#             self.current_stream_count = 1
-#             self.use_rl = False
-
-#         self.is_downloading = True
-#         self.start_time = time.time()
-
-#         if self.use_rl:
-#             max_streams = MAX_STREAMS
-#         else:
-#             max_streams = self.num_streams
-
-#         self.chunks = self._calculate_chunks(size, max_streams)
-#         remaining = list(range(len(self.chunks)))
-
-#         while remaining and self.is_downloading:
-#             self._run_monitoring_interval()
-
-#             active = len([t for t in self.threads if t.is_alive()])
-#             available = self.current_stream_count - active
-
-#             while available > 0 and remaining:
-#                 chunk_id = remaining.pop(0)
-#                 start, end = self.chunks[chunk_id]
-#                 temp = f"{output}.part{chunk_id}"
-#                 self.temp_files.append(temp)
-#                 t = threading.Thread(target=self._download_chunk,
-#                                      args=(chunk_id, start, end, temp),
-#                                      daemon=True)
-#                 t.start()
-#                 self.threads.append(t)
-#                 available -= 1
-
-#             self.threads = [t for t in self.threads if t.is_alive()]
-#             time.sleep(0.3)
-
-#         for t in self.threads:
-#             t.join()
-
-#         self._assemble(output)
-#         return output
-
-#     def _assemble(self, output):
-#         with open(output, "wb") as outfile:
-#             for part in self.temp_files:
-#                 if os.path.exists(part):
-#                     with open(part, "rb") as pf:
-#                         outfile.write(pf.read())
-#                     os.remove(part)
-
-#     def cancel(self):
-#         self.is_downloading = False
 """
 downloader.py
-MultiStreamDownloader — parallel HTTP downloader with optional RL optimization
+
+MultiStreamDownloader — parallel HTTP downloader with optional RL-based
+stream count optimization.
+
+Design principles:
+- No RL logic here
+- No Q-table, no reward function, no agent
+- When use_rl=True, calls adapter.decide() and adapter.learn() — that's all
+- All RL decisions flow through the adapter → engine → EdgePolicy → RLAgent
 """
 
 import os
 import requests
 import threading
-import uuid
-import shutil
 from urllib.parse import urlparse, unquote
 import time
+import subprocess
+import platform
 import logging
 
 from config import (
     DEFAULT_NUM_STREAMS, MIN_STREAMS, MAX_STREAMS,
-    MIN_CHUNK_SIZE, BUFFER_SIZE,
+    DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE, BUFFER_SIZE,
     CONNECTION_TIMEOUT, READ_TIMEOUT,
     RL_MONITORING_INTERVAL, DOWNLOAD_FOLDER,
+    ENABLE_VERBOSE_LOGGING, LOG_NETWORK_METRICS,
 )
 from adapter import adapter
 
@@ -217,223 +33,534 @@ logger = logging.getLogger(__name__)
 
 
 class MultiStreamDownloader:
+    """
+    Multi-stream HTTP downloader with optional RL-based stream optimization.
 
-    def __init__(self, url, num_streams=DEFAULT_NUM_STREAMS, progress_callback=None, use_rl=False):
+    When use_rl=True:
+        - Calls adapter.decide() at each monitoring interval
+        - Calls adapter.learn() after each interval to update the engine
+        - Never touches Q-tables, rewards, or epsilon directly
+
+    When use_rl=False:
+        - Uses a fixed stream count throughout
+    """
+
+    def __init__(
+        self,
+        url: str,
+        num_streams: int = DEFAULT_NUM_STREAMS,
+        progress_callback=None,
+        use_rl: bool = False,
+    ):
         self.url = url
         self.num_streams = min(max(num_streams, MIN_STREAMS), MAX_STREAMS)
-        self.use_rl = use_rl
         self.progress_callback = progress_callback
-        self.download_id = str(uuid.uuid4())[:8]  # Unique ID for this download instance
+        self.use_rl = use_rl
 
-        self.current_stream_count = self.num_streams
+        # Download state
         self.file_size = 0
         self.downloaded_bytes = 0
-        self.is_downloading = False
         self.chunks = []
-        self.threads = []
         self.temp_files = []
+        self.is_downloading = False
+        self.threads = []
         self.lock = threading.Lock()
         self.start_time = None
 
+        # Chunk metrics
+        self.chunk_start_times = {}
+        self.chunk_end_times = {}
+        self.chunk_speeds = {}
+        self.chunk_bytes = {}
+        self.failed_chunks = set()
+        self.active_chunks = set()
+
+        # Network metrics (updated each monitoring interval)
+        self.network_metrics = {
+            "throughput": 0.0,
+            "rtt": 100.0,
+            "packet_loss": 0.1,
+            "last_update": time.time(),
+        }
+        self._last_packet_loss = 0.1
+
+        # Monitoring interval tracking
         self._last_mi_time = time.time()
         self._last_mi_bytes = 0
 
+        # Current stream count
         if self.use_rl:
             self.current_stream_count = adapter.current_connections
-            logger.info(f"RL enabled. Initial streams: {self.current_stream_count}")
+            logger.info("RL Mode enabled — initial streams: %d", self.current_stream_count)
+        else:
+            self.current_stream_count = self.num_streams
+            logger.info("Static Mode — streams: %d", self.num_streams)
 
-    # ------------------------------------------------------------
-    # CRITICAL FIX → expose current stream count to backend
-    # ------------------------------------------------------------
-    def get_current_streams(self):
-        return self.current_stream_count
+    # -----------------------------------------------------------------------
+    # Network metrics
+    # -----------------------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # Basic network stats
-    # ------------------------------------------------------------
-    def calculate_throughput(self):
+    def measure_rtt(self) -> float:
+        """Measure RTT via ping, fall back to chunk-based estimate."""
+        try:
+            hostname = urlparse(self.url).hostname
+            param = "-n" if platform.system().lower() == "windows" else "-c"
+            result = subprocess.run(
+                ["ping", param, "1", "-W", "2", hostname],
+                capture_output=True, text=True, timeout=3,
+            )
+            output = result.stdout.lower()
+            if "time=" in output:
+                rtt_str = output.split("time=")[1].split()[0]
+                return float(rtt_str.replace("ms", ""))
+        except Exception as e:
+            logger.debug("RTT ping failed: %s", e)
+        return self._estimate_rtt_from_chunks()
+
+    def _estimate_rtt_from_chunks(self) -> float:
+        if len(self.chunk_start_times) < 2:
+            return 100.0
+        starts = sorted(self.chunk_start_times.values())
+        gaps = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+        min_gap = min(gaps) if gaps else 0.1
+        return min(1000.0, max(10.0, min_gap * 1000))
+
+    def _estimate_packet_loss(self) -> float:
+        if not self.chunk_speeds or len(self.chunk_speeds) < 3:
+            return 0.1
+
+        recent_speeds = list(self.chunk_speeds.values())[-5:]
+        avg_speed = sum(recent_speeds) / len(recent_speeds)
+        if avg_speed < 0.1:
+            return 1.0
+
+        variance = sum((s - avg_speed) ** 2 for s in recent_speeds) / len(recent_speeds)
+        cv = (variance ** 0.5) / avg_speed
+
+        total = len(self.chunks)
+        failed = len(self.failed_chunks)
+        failure_rate = failed / total if total > 0 else 0
+
+        loss_from_variance = min(1.0, cv * 2.0)
+        loss_from_failures = min(3.0, failure_rate * 15.0)
+
+        estimated = loss_from_variance * 0.3 + loss_from_failures * 0.7
+        smoothed = 0.7 * self._last_packet_loss + 0.3 * estimated
+        self._last_packet_loss = smoothed
+        return max(0.1, min(5.0, smoothed))
+
+    def calculate_throughput(self) -> float:
         now = time.time()
         elapsed = now - self._last_mi_time
-        if elapsed <= 0:
-            return 0
+        if elapsed < 0.1:
+            # Fall back to total average on first call
+            if self.start_time and self.downloaded_bytes > 0:
+                total_elapsed = now - self.start_time
+                if total_elapsed > 0.1:
+                    return (self.downloaded_bytes * 8) / (total_elapsed * 1024 * 1024)
+            return 0.0
         bytes_delta = self.downloaded_bytes - self._last_mi_bytes
-        return (bytes_delta * 8) / (elapsed * 1024 * 1024)
+        return (bytes_delta * 8) / (elapsed * 1024 * 1024)  # Mbps
 
-    def get_speed(self):
+    def get_speed(self) -> float:
+        """Return current speed in MB/s."""
         return self.calculate_throughput() / 8
 
-    # ------------------------------------------------------------
-    # RL monitoring interval
-    # ------------------------------------------------------------
-    def _run_monitoring_interval(self):
-        if not self.use_rl:
-            return
+    def get_current_streams(self) -> int:
+        """Return current number of active streams."""
+        return self.current_stream_count
 
-        if time.time() - self._last_mi_time < RL_MONITORING_INTERVAL:
-            return
-
+    def _update_network_metrics(self):
         throughput = self.calculate_throughput()
+        rtt = self.measure_rtt()
+        packet_loss = self._estimate_packet_loss()
 
-        if throughput > 0:
-            adapter.learn(throughput, 100, 0.1)
+        self.network_metrics.update({
+            "throughput": throughput,
+            "rtt": rtt,
+            "packet_loss": packet_loss,
+            "last_update": time.time(),
+        })
 
-        new_streams = adapter.decide(throughput, 100, 0.1)
+        if LOG_NETWORK_METRICS:
+            logger.info(
+                "Network: T=%.2fMbps RTT=%.1fms Loss=%.2f%%",
+                throughput, rtt, packet_loss,
+            )
 
-        if new_streams != self.current_stream_count:
-            logger.info(f"Streams changed {self.current_stream_count} → {new_streams}")
-            self.current_stream_count = new_streams
+        return throughput, rtt, packet_loss
 
-        self._last_mi_bytes = self.downloaded_bytes
-        self._last_mi_time = time.time()
+    # -----------------------------------------------------------------------
+    # Monitoring interval — calls adapter, not RL directly
+    # -----------------------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # Chunk handling
-    # ------------------------------------------------------------
-    def _get_filename(self):
+    def _should_run_mi(self) -> bool:
+        return time.time() - self._last_mi_time >= RL_MONITORING_INTERVAL
+
+    def _run_monitoring_interval(self) -> None:
+        """
+        One monitoring interval cycle:
+          1. Measure network state
+          2. Tell engine what happened (learn)
+          3. Ask engine what to do next (decide)
+          4. Apply the decision
+        """
+        if not self.use_rl or not self._should_run_mi():
+            return
+
+        try:
+            throughput, rtt, packet_loss = self._update_network_metrics()
+
+            # Step 2: learn from what happened since last decision
+            adapter.learn(throughput, rtt, packet_loss)
+
+            # Step 3: get new stream count recommendation
+            new_stream_count = adapter.decide(throughput, rtt, packet_loss)
+
+            # Step 4: apply it
+            if new_stream_count != self.current_stream_count:
+                logger.info(
+                    "Streams adjusted: %d → %d",
+                    self.current_stream_count, new_stream_count,
+                )
+                self.current_stream_count = new_stream_count
+
+            self._last_mi_time = time.time()
+            self._last_mi_bytes = self.downloaded_bytes
+
+        except Exception as e:
+            logger.error("Monitoring interval error: %s", e)
+
+    # -----------------------------------------------------------------------
+    # Chunk management
+    # -----------------------------------------------------------------------
+
+    def _get_filename_from_url(self) -> str:
         path = urlparse(self.url).path
         filename = unquote(os.path.basename(path))
-        return filename or "downloaded_file"
+        return filename if filename else "downloaded_file"
 
     def check_download_support(self):
-        response = requests.head(self.url, timeout=CONNECTION_TIMEOUT, allow_redirects=True)
-        supports_ranges = response.headers.get("Accept-Ranges") == "bytes"
-        size = int(response.headers.get("Content-Length", 0))
-        return supports_ranges, size, self._get_filename()
+        """Check if server supports range requests."""
+        try:
+            response = requests.head(
+                self.url, timeout=CONNECTION_TIMEOUT, allow_redirects=True
+            )
+            supports_ranges = response.headers.get("Accept-Ranges") == "bytes"
+            file_size = int(response.headers.get("Content-Length", 0))
+            cd = response.headers.get("Content-Disposition", "")
+            filename = (
+                cd.split("filename=")[1].strip('"')
+                if "filename=" in cd
+                else self._get_filename_from_url()
+            )
+            return supports_ranges, file_size, filename
 
-    def _calculate_chunks(self, size, streams):
-        chunk_size = size // streams
+        except Exception:
+            try:
+                response = requests.get(
+                    self.url,
+                    headers={"Range": "bytes=0-0"},
+                    timeout=CONNECTION_TIMEOUT,
+                    stream=True,
+                )
+                supports_ranges = response.status_code == 206
+                if "Content-Range" in response.headers:
+                    file_size = int(response.headers["Content-Range"].split("/")[-1])
+                else:
+                    file_size = int(response.headers.get("Content-Length", 0))
+                response.close()
+                return supports_ranges, file_size, self._get_filename_from_url()
+            except Exception as e:
+                logger.error("Range check failed: %s", e)
+                return False, 0, self._get_filename_from_url()
+
+    def _calculate_chunks(self, file_size: int, max_streams: int) -> list:
+        min_chunk_size = max(MIN_CHUNK_SIZE, 1024 * 1024)
+        if file_size < min_chunk_size * max_streams:
+            actual_chunks = max(1, file_size // min_chunk_size)
+        else:
+            actual_chunks = max_streams
+
+        chunk_size = file_size // actual_chunks
         chunks = []
-        for i in range(streams):
+        for i in range(actual_chunks):
             start = i * chunk_size
-            end = size - 1 if i == streams - 1 else (i + 1) * chunk_size - 1
+            end = file_size - 1 if i == actual_chunks - 1 else (i + 1) * chunk_size - 1
             chunks.append((start, end))
+
+        logger.info("Created %d chunks (%.1f MB each)", len(chunks), chunk_size / (1024 * 1024))
         return chunks
 
-    def _download_chunk(self, chunk_id, start, end, temp_file):
+    def _download_chunk(self, chunk_id: int, start: int, end: int, temp_file: str) -> None:
         headers = {"Range": f"bytes={start}-{end}"}
+
+        with self.lock:
+            self.chunk_start_times[chunk_id] = time.time()
+            self.active_chunks.add(chunk_id)
+
+        chunk_bytes = 0
+        chunk_start = time.time()
+
         try:
-            with requests.get(self.url, headers=headers, stream=True,
-                              timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT)) as r:
+            with requests.get(
+                self.url,
+                headers=headers,
+                stream=True,
+                timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT),
+            ) as r:
+                if r.status_code not in [200, 206]:
+                    logger.warning("Chunk %d: bad status %d", chunk_id, r.status_code)
+                    with self.lock:
+                        self.failed_chunks.add(chunk_id)
+                        self.active_chunks.discard(chunk_id)
+                    return
+
                 with open(temp_file, "wb") as f:
                     for data in r.iter_content(chunk_size=BUFFER_SIZE):
                         if not self.is_downloading:
                             break
                         f.write(data)
+                        chunk_bytes += len(data)
                         with self.lock:
                             self.downloaded_bytes += len(data)
+                            if self.progress_callback:
+                                self.progress_callback(self.downloaded_bytes, self.file_size)
+
+            chunk_elapsed = time.time() - chunk_start
+            with self.lock:
+                self.chunk_end_times[chunk_id] = time.time()
+                self.chunk_bytes[chunk_id] = chunk_bytes
+                self.chunk_speeds[chunk_id] = (
+                    (chunk_bytes / (1024 * 1024)) / max(chunk_elapsed, 0.1)
+                )
+                self.active_chunks.discard(chunk_id)
+
         except Exception as e:
-            logger.error(f"Chunk {chunk_id} failed: {e}")
+            logger.error("Chunk %d failed: %s", chunk_id, e)
+            with self.lock:
+                self.failed_chunks.add(chunk_id)
+                self.active_chunks.discard(chunk_id)
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
 
-    # ------------------------------------------------------------
-    # Download logic
-    # ------------------------------------------------------------
-    def download(self):
-        supports, size, filename = self.check_download_support()
-        self.file_size = size
-        output = os.path.join(DOWNLOAD_FOLDER, filename)
-        os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+    def _start_chunk_download(self, chunk_id: int, output_path: str) -> None:
+        if chunk_id >= len(self.chunks):
+            return
+        start, end = self.chunks[chunk_id]
+        temp_file = f"{output_path}.part{chunk_id}"
+        if temp_file not in self.temp_files:
+            self.temp_files.append(temp_file)
+        thread = threading.Thread(
+            target=self._download_chunk,
+            args=(chunk_id, start, end, temp_file),
+            daemon=True,
+        )
+        thread.start()
+        self.threads.append(thread)
 
-        if not supports:
-            self.num_streams = 1
-            self.current_stream_count = 1
-            self.use_rl = False
+    # -----------------------------------------------------------------------
+    # Download strategies
+    # -----------------------------------------------------------------------
 
+    def _download_with_rl(self, output_path: str) -> bool:
+        """Adaptive download — stream count driven by TurboLaneEngine."""
+        logger.info("Starting RL-based adaptive download")
         self.is_downloading = True
+        self.downloaded_bytes = 0
+        self.start_time = time.time()
+        self._last_mi_time = self.start_time
+        self.threads, self.temp_files = [], []
+
+        self.chunks = self._calculate_chunks(self.file_size, MAX_STREAMS)
+        remaining = set(range(len(self.chunks)))
+
+        initial = min(self.current_stream_count, len(remaining))
+        logger.info("Starting with %d streams", initial)
+        for _ in range(initial):
+            if remaining:
+                self._start_chunk_download(remaining.pop(), output_path)
+
+        last_progress_log = time.time()
+
+        while (remaining or self.threads) and self.is_downloading:
+            self._run_monitoring_interval()
+            self.threads = [t for t in self.threads if t.is_alive()]
+
+            available_slots = self.current_stream_count - len(self.threads)
+            if available_slots > 0 and remaining:
+                for _ in range(min(available_slots, len(remaining))):
+                    if remaining:
+                        self._start_chunk_download(remaining.pop(), output_path)
+
+            if time.time() - last_progress_log >= 5:
+                if self.downloaded_bytes > 0 and self.file_size > 0:
+                    progress = (self.downloaded_bytes / self.file_size) * 100
+                    logger.info(
+                        "Progress: %.1f%% | Active: %d | Speed: %.1f Mbps | Streams: %d",
+                        progress, len(self.active_chunks), self.calculate_throughput(),
+                        self.current_stream_count
+                    )
+                last_progress_log = time.time()
+
+            time.sleep(0.5)
+
+        for thread in self.threads:
+            thread.join(timeout=60)
+
+        success = len(self.failed_chunks) == 0
+        total_time = time.time() - self.start_time
+        logger.info(
+            "Download complete in %.1fs | Success rate: %.1f%%",
+            total_time,
+            (len(self.chunks) - len(self.failed_chunks)) / max(len(self.chunks), 1) * 100,
+        )
+        return success
+
+    def _download_static(self, output_path: str) -> bool:
+        """Fixed-stream download — no RL."""
+        logger.info("Starting static download with %d streams", self.num_streams)
+        self.is_downloading = True
+        self.downloaded_bytes = 0
         self.start_time = time.time()
 
-        if self.use_rl:
-            max_streams = MAX_STREAMS
-        else:
-            max_streams = self.num_streams
+        self.chunks = self._calculate_chunks(self.file_size, self.num_streams)
+        for i in range(len(self.chunks)):
+            self._start_chunk_download(i, output_path)
 
-        self.chunks = self._calculate_chunks(size, max_streams)
-        remaining = list(range(len(self.chunks)))
+        for thread in self.threads:
+            thread.join(timeout=300)
 
-        while remaining and self.is_downloading:
-            self._run_monitoring_interval()
+        success = len(self.failed_chunks) == 0
+        logger.info("Download complete in %.1fs", time.time() - self.start_time)
+        return success
 
-            active = len([t for t in self.threads if t.is_alive()])
-            available = self.current_stream_count - active
+    # -----------------------------------------------------------------------
+    # File assembly
+    # -----------------------------------------------------------------------
 
-            while available > 0 and remaining:
-                chunk_id = remaining.pop(0)
-                start, end = self.chunks[chunk_id]
-                # FIXED: Use unique temp file names with download_id
-                temp = f"{output}.part{chunk_id}.{self.download_id}.tmp"
-                self.temp_files.append(temp)
-                t = threading.Thread(target=self._download_chunk,
-                                     args=(chunk_id, start, end, temp),
-                                     daemon=True)
-                t.start()
-                self.threads.append(t)
-                available -= 1
-
-            self.threads = [t for t in self.threads if t.is_alive()]
-            time.sleep(0.3)
-
-        for t in self.threads:
-            t.join()
-
-        # FIXED: Better assembly with temporary output file
-        return self._assemble(output)
-
-    def _assemble(self, output):
-        """Assemble chunks into final file with better error handling"""
-        # Use a temporary file for assembly to avoid partial writes
-        temp_output = f"{output}.{self.download_id}.tmp"
-        
+    def _assemble_file(self, output_file: str) -> None:
+        logger.info("Assembling %d parts", len(self.temp_files))
         try:
-            # Sort temp files by chunk ID to ensure correct order
-            self.temp_files.sort()
-            
-            with open(temp_output, "wb") as outfile:
-                for part in self.temp_files:
-                    if os.path.exists(part):
-                        try:
-                            with open(part, "rb") as pf:
-                                shutil.copyfileobj(pf, outfile)
-                        except Exception as e:
-                            logger.error(f"Error reading chunk {part}: {e}")
-                            raise
-                    else:
-                        logger.error(f"Missing chunk: {part}")
-                        raise FileNotFoundError(f"Missing chunk file: {part}")
+            with open(output_file, "wb") as out:
+                for tmp in self.temp_files:
+                    if os.path.exists(tmp):
+                        with open(tmp, "rb") as part:
+                            out.write(part.read())
+                        os.remove(tmp)
 
-            # If original output exists and is different, handle it
-            if os.path.exists(output):
-                # If files are the same size and content, we can skip
-                if os.path.getsize(output) == os.path.getsize(temp_output):
-                    # Quick check if they're the same file
-                    if not os.path.samefile(output, temp_output):
-                        os.remove(temp_output)
-                        return output
+            if os.path.exists(output_file):
+                actual_size = os.path.getsize(output_file)
+                if actual_size == self.file_size:
+                    logger.info("File assembled and verified")
                 else:
-                    # Different file, create backup with timestamp
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    backup = f"{output}.{timestamp}.bak"
-                    shutil.move(output, backup)
-                    logger.info(f"Existing file backed up to {backup}")
-
-            # Move temp file to final destination
-            shutil.move(temp_output, output)
-            logger.info(f"Successfully assembled file: {output}")
-            
+                    logger.warning(
+                        "Size mismatch: expected %d, got %d",
+                        self.file_size, actual_size,
+                    )
         except Exception as e:
-            logger.error(f"Assembly failed: {e}")
-            # Clean up temp file if it exists
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
-            raise
-        finally:
-            # Clean up chunk files
-            for part in self.temp_files:
+            logger.error("File assembly error: %s", e)
+
+    def cleanup(self) -> None:
+        for f in self.temp_files:
+            if os.path.exists(f):
                 try:
-                    if os.path.exists(part):
-                        os.remove(part)
-                except Exception as e:
-                    logger.error(f"Error removing chunk {part}: {e}")
+                    os.remove(f)
+                except Exception:
+                    pass
 
-        return output
-
-    def cancel(self):
+    def cancel(self) -> None:
+        logger.info("Cancelling download")
         self.is_downloading = False
+        time.sleep(1)
+        self.cleanup()
+
+    # -----------------------------------------------------------------------
+    # Main entry point
+    # -----------------------------------------------------------------------
+
+    def download(self, output_path: str = None) -> str | None:
+        """
+        Download the file.
+
+        Returns:
+            Path to downloaded file on success, None on failure.
+        """
+        try:
+            supports_ranges, file_size, filename = self.check_download_support()
+            self.file_size = file_size
+
+            if not supports_ranges:
+                logger.warning("Range requests not supported — falling back to single stream")
+                self.num_streams = 1
+                self.use_rl = False
+
+            output_path = output_path or os.path.join(DOWNLOAD_FOLDER, filename)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            logger.info("Output: %s | Size: %.1f MB", output_path, file_size / (1024 * 1024))
+
+            if self.use_rl:
+                success = self._download_with_rl(output_path)
+            else:
+                success = self._download_static(output_path)
+
+            if success and self.is_downloading:
+                self._assemble_file(output_path)
+
+                if self.use_rl:
+                    adapter.save()
+
+                logger.info("Average throughput: %.2f Mbps", self.calculate_throughput())
+                return output_path
+            else:
+                self.cleanup()
+                return None
+
+        except Exception as e:
+            logger.error("Download error: %s", e)
+            import traceback
+            traceback.print_exc()
+            self.cleanup()
+            return None
+
+    # -----------------------------------------------------------------------
+    # Stats / metrics
+    # -----------------------------------------------------------------------
+
+    def get_stats(self) -> dict:
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        stats = {
+            "elapsed_time": elapsed,
+            "downloaded_bytes": self.downloaded_bytes,
+            "file_size": self.file_size,
+            "progress": (self.downloaded_bytes / self.file_size * 100) if self.file_size > 0 else 0,
+            "throughput_mbps": self.calculate_throughput(),
+            "num_chunks": len(self.chunks),
+            "completed_chunks": len(self.chunk_end_times),
+            "failed_chunks": len(self.failed_chunks),
+            "active_chunks": len(self.active_chunks),
+        }
+        if self.use_rl:
+            stats["rl_stats"] = adapter.get_stats()
+        return stats
+
+    def get_detailed_metrics(self) -> dict:
+        stats = self.get_stats()
+        return {
+            **stats,
+            "current_stream_count": self.current_stream_count,
+            "use_rl": self.use_rl,
+            "url": self.url,
+            "is_downloading": self.is_downloading,
+            "network_metrics": self.network_metrics.copy(),
+            "chunk_progress": {
+                "total": len(self.chunks),
+                "completed": len(self.chunk_end_times),
+                "failed": len(self.failed_chunks),
+                "active": len(self.active_chunks),
+            },
+        }

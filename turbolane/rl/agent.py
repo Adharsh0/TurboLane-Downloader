@@ -155,7 +155,9 @@ class RLAgent:
         return max(self.Q[state], key=self.Q[state].__getitem__)
 
     def _max_q(self, state: tuple) -> float:
-        self._init_state(state)
+        # Don't call _init_state here — only peek if state already exists
+        if state not in self.Q:
+            return 0.0   # ← return 0 for unseen states instead of creating them
         return max(self.Q[state].values())
 
     # -----------------------------------------------------------------------
@@ -322,8 +324,10 @@ class RLAgent:
 
     def get_stats(self) -> dict:
         avg_reward = self._total_reward / self.total_updates if self.total_updates > 0 else 0.0
+        q_states = len(self.Q)
         return {
-            "q_table_states": len(self.Q),
+            "q_table_states": q_states,
+            "q_table_size": q_states,          # ← ADD THIS LINE (UI reads this key)
             "current_connections": self.current_connections,
             "exploration_rate": round(self.exploration_rate, 4),
             "total_decisions": self.total_decisions,
@@ -334,7 +338,7 @@ class RLAgent:
             "negative_rewards": self._negative_rewards,
             "throughput_improvements": self._throughput_improvements,
             "monitoring_interval": self.monitoring_interval,
-        }
+    }
 
     def reset(self) -> None:
         """Clear all learned state."""

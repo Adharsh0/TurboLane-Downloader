@@ -1,4 +1,3 @@
-
 """
 app.py — Flask web interface for TurboLane Download Manager.
 
@@ -120,7 +119,7 @@ class DownloadManager:
                         info["total_size"] = downloader.file_size
                     info["speed"] = downloader.get_speed() if hasattr(downloader, "get_speed") else 0
                 
-                # Update current stream count for RL mode
+                # Update current stream count for RL mode - Always update
                 if info.get("use_rl") and hasattr(downloader, "get_current_streams"):
                     info["current_streams"] = downloader.get_current_streams()
                 elif hasattr(downloader, "num_streams"):
@@ -129,6 +128,7 @@ class DownloadManager:
             except Exception:
                 pass
 
+        # Return both stream_count and current_streams for compatibility
         return {
             "url": info["url"],
             "mode": info["mode"],
@@ -143,7 +143,9 @@ class DownloadManager:
             "downloaded_size": info.get("downloaded_size", 0),
             "use_rl": info.get("use_rl", False),
             "num_streams": info.get("num_streams", 0),
-            "stream_count": info.get("current_streams", info.get("num_streams", 0)),  # Return current stream count
+            # Send both field names for compatibility
+            "stream_count": info.get("current_streams", info.get("num_streams", 0)),
+            "current_streams": info.get("current_streams", info.get("num_streams", 0)),
         }
 
     def cancel_download(self, download_id):

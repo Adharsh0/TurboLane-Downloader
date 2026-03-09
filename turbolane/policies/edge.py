@@ -1,11 +1,30 @@
-
 """
 turbolane/policies/edge.py
 
 EdgePolicy — the policy wrapper for edge / public internet environments.
+
+Responsibilities:
+- Own the RLAgent instance
+- Own the QTableStorage instance
+- Expose a clean, stable interface to the engine
+- Handle persistence (auto-save, load on init)
+- Apply edge-specific action constraints (optimal stream range for HTTP downloads)
+
+Design principles:
+- No networking code
+- No application logic
+- Agent-type-agnostic interface (same methods regardless of Q-learning or PPO)
+
+Edge vs DCI differences:
+- Finer throughput discretization (6 bins vs 5) for typical HTTP download speeds
+- Optimal stream range awareness (6–10 streams for public CDN downloads)
+- Action constraints tuned for high-RTT, variable-loss public internet conditions
+- Progressive stream cost in reward to discourage unnecessary connections
 """
 
 import logging
+from pathlib import Path
+
 from turbolane.rl.agent import RLAgent
 from turbolane.rl.storage import QTableStorage
 
@@ -13,7 +32,21 @@ logger = logging.getLogger(__name__)
 
 
 class EdgePolicy:
+    """
+    Policy for edge / public internet download environments.
 
+    Public interface:
+        decide(throughput, rtt, loss_pct)        → int  (stream count)
+        learn(throughput, rtt, loss_pct)                (Q-update)
+        save()                                          (persist to disk)
+        get_stats()                              → dict
+        reset()                                         (clear learned state)
+
+    All methods have identical signatures regardless of whether
+    the backend is Q-learning or PPO — future migration is transparent.
+    """
+
+    # Optimal stream range for public internet HTTP downloads
     OPTIMAL_MIN = 6
     OPTIMAL_MAX = 10
     OPTIMAL_BONUS = 12.0
@@ -26,11 +59,11 @@ class EdgePolicy:
         min_connections: int = 1,
         max_connections: int = 16,
         default_connections: int = 8,
-        learning_rate: float = 0.2,
+        learning_rate: float = 0.1,
         discount_factor: float = 0.8,
-        exploration_rate: float = 0.25,
-        exploration_decay: float = 0.99,
-        min_exploration: float = 0.08,
+        exploration_rate: float = 0.3,
+        exploration_decay: float = 0.995,
+        min_exploration: float = 0.05,
         monitoring_interval: float = 5.0,
         auto_save_every: int = 50,
     ):
@@ -63,22 +96,28 @@ class EdgePolicy:
             self.OPTIMAL_MIN, self.OPTIMAL_MAX,
         )
 
-    def decide(self, throughput_mbps, rtt_ms, loss_pct):
+    # -----------------------------------------------------------------------
+    # Core interface
+    # -----------------------------------------------------------------------
+
+    def decide(self, throughput_mbps: float, rtt_ms: float, loss_pct: float) -> int:
         return self._agent.make_decision(throughput_mbps, rtt_ms, loss_pct)
 
-    def learn(self, throughput_mbps, rtt_ms, loss_pct):
+    def learn(self, throughput_mbps: float, rtt_ms: float, loss_pct: float) -> None:
         self._agent.learn_from_feedback(throughput_mbps, rtt_ms, loss_pct)
+
         if (
             self._auto_save_every > 0
             and self._agent.total_updates > 0
             and self._agent.total_updates % self._auto_save_every == 0
         ):
+            logger.debug("Auto-save triggered at update #%d", self._agent.total_updates)
             self.save()
 
-    def save(self):
+    def save(self) -> bool:
         return self._storage.save(self._agent.Q, self._agent.get_stats())
 
-    def get_stats(self):
+    def get_stats(self) -> dict:
         stats = self._agent.get_stats()
         stats["model_dir"] = self._storage.model_dir
         stats["model_exists_on_disk"] = self._storage.exists()
@@ -91,19 +130,48 @@ class EdgePolicy:
             stats["stream_range_status"] = "above_optimal"
         return stats
 
-    def reset(self):
+    def reset(self) -> None:
         self._agent.reset()
         logger.info("EdgePolicy: agent state reset")
 
+    # -----------------------------------------------------------------------
+    # Properties
+    # -----------------------------------------------------------------------
+
     @property
-    def current_connections(self):
+    def current_connections(self) -> int:
         return self._agent.current_connections
 
     @property
-    def agent(self):
+    def agent(self) -> RLAgent:
         return self._agent
 
-    def _discretize_state(self, throughput_mbps, rtt_ms, loss_pct):
+    # -----------------------------------------------------------------------
+    # Edge-specific policy functions (injected into RLAgent)
+    # -----------------------------------------------------------------------
+
+    def _discretize_state(
+        self,
+        throughput_mbps: float,
+        rtt_ms: float,
+        loss_pct: float,
+    ) -> tuple:
+        """
+        Edge-tuned state discretization.
+
+        Throughput bins (Mbps): 0-10, 10-20, 20-30, 30-40, 40-50, 50+
+            6 bins — public CDN speeds cluster in the 10-50 Mbps range.
+        RTT bins (ms): 0-50, 50-150, 150-300, 300-600, 600-1000, 1000+
+            6 bins — extended range covers real-world high-latency connections.
+            Previous 4-bin version capped at 150ms, causing all high-RTT
+            connections to collapse into the same state and preventing
+            Q-table growth.
+        Loss bins (%): 0-0.1, 0.1-0.5, 0.5-1.0, 1.0-2.0, 2.0+
+            5 bins — unchanged, loss thresholds are protocol-driven.
+
+        Total states: 6 × 6 × 5 = 180
+        """
+        # Throughput level (0-5)
         if throughput_mbps < 10:
             t = 0
         elif throughput_mbps < 20:
@@ -117,16 +185,22 @@ class EdgePolicy:
         else:
             t = 5
 
-        if rtt_ms < 30:
+        # RTT level (0-5) — extended to cover real-world high-latency connections
+        if rtt_ms < 50:
             r = 0
-        elif rtt_ms < 80:
-            r = 1
         elif rtt_ms < 150:
+            r = 1
+        elif rtt_ms < 300:
             r = 2
-        else:
+        elif rtt_ms < 600:
             r = 3
+        elif rtt_ms < 1000:
+            r = 4
+        else:
+            r = 5
 
-        if loss_pct < 0.2:
+        # Loss level (0-4)
+        if loss_pct < 0.1:
             l = 0
         elif loss_pct < 0.5:
             l = 1
@@ -139,29 +213,78 @@ class EdgePolicy:
 
         return (t, r, l)
 
-    def _compute_reward(self, prev_throughput, curr_throughput, curr_loss_pct, curr_rtt_ms, num_streams):
-        # Throughput delta — small honest signal
-        tput_delta = (curr_throughput - prev_throughput) * 0.05
+    def _compute_reward(
+        self,
+        prev_throughput: float,
+        curr_throughput: float,
+        curr_loss_pct: float,
+        curr_rtt_ms: float,
+        num_streams: int,
+    ) -> float:
+        """
+        Edge reward function.
 
-        # Loss/RTT penalties
+        Components:
+          + throughput improvement (primary signal)
+          − quadratic loss penalty
+          − RTT penalty (congestion signal)
+          − progressive stream cost (discourages unnecessary connections)
+          + optimal range bonus (6-10 streams → strongest incentive)
+          + extended range bonus (10-12 streams → moderate incentive)
+        """
+        # Throughput improvement
+        tput_delta = curr_throughput - prev_throughput
+
+        # Quadratic loss penalty
         loss_penalty = (curr_loss_pct ** 2) * 0.5
-        rtt_penalty = max(0.0, (curr_rtt_ms - 50.0) * 0.01)
 
-        # Stream range reward — the dominant signal
-        if self.OPTIMAL_MIN <= num_streams <= self.OPTIMAL_MAX:
-            stream_reward = 3.0                                        # strong: stay here
-        elif num_streams < self.OPTIMAL_MIN:
-            stream_reward = -2.0 * (self.OPTIMAL_MIN - num_streams)   # penalty below range
+        # RTT congestion penalty — scaled for extended RTT range
+        rtt_penalty = max(0.0, (curr_rtt_ms - 50.0) * 0.005)
+
+        # Progressive stream overhead
+        if num_streams <= self.OPTIMAL_MIN:
+            stream_penalty = 0.0
+        elif num_streams <= self.OPTIMAL_MAX:
+            stream_penalty = (num_streams - self.OPTIMAL_MIN) * 0.1
         elif num_streams <= self.EXTENDED_MAX:
-            stream_reward = 1.0                                        # mild: extended range ok
+            stream_penalty = (num_streams - self.OPTIMAL_MAX) * 0.5 + 0.4
         else:
-            stream_reward = -1.0 * (num_streams - self.EXTENDED_MAX)  # too many streams
+            stream_penalty = (num_streams - self.EXTENDED_MAX) * 1.5 + 1.4
 
-        reward = tput_delta + stream_reward - loss_penalty - rtt_penalty
+        # Efficiency bonus: throughput per stream
+        efficiency = curr_throughput / max(1, num_streams)
+        efficiency_bonus = min(2.0, efficiency * 0.1) if efficiency > 4.0 else 0.0
+
+        reward = (
+            tput_delta * 0.1
+            + efficiency_bonus
+            - loss_penalty
+            - rtt_penalty
+            - stream_penalty
+        )
+
+        # Optimal range bonus
+        if self.OPTIMAL_MIN <= num_streams <= self.OPTIMAL_MAX:
+            reward += self.OPTIMAL_BONUS * 0.1
+        elif num_streams <= self.EXTENDED_MAX:
+            reward += self.EXTENDED_BONUS * 0.1
 
         return max(-5.0, min(5.0, reward))
 
-    def _apply_constraints(self, proposed_connections, current_connections, recent_metrics):
+    def _apply_constraints(
+        self,
+        proposed_connections: int,
+        current_connections: int,
+        recent_metrics: list,
+    ) -> int:
+        """
+        Edge-specific action constraints.
+
+        Guards:
+        - Good conditions  → don't drop below OPTIMAL_MIN
+        - Good conditions  → cap at EXTENDED_MAX
+        - Poor conditions  → limit increases to +1
+        """
         result = max(self._min_connections, min(self._max_connections, proposed_connections))
 
         if not recent_metrics:
@@ -171,37 +294,30 @@ class EdgePolicy:
         avg_loss = sum(m["loss"] for m in recent_metrics) / len(recent_metrics)
         avg_rtt = sum(m["rtt"] for m in recent_metrics) / len(recent_metrics)
 
-        # Good conditions: hard floor at OPTIMAL_MIN, never go below it
-        if avg_throughput > 10 and avg_loss < 1.0 and avg_rtt < 200:
-            if result < self.OPTIMAL_MIN:
-                logger.debug(
-                    "EdgePolicy: good conditions (tput=%.1f, loss=%.2f%%, rtt=%.1f), "
-                    "floor enforced at OPTIMAL_MIN=%d",
-                    avg_throughput, avg_loss, avg_rtt, self.OPTIMAL_MIN,
-                )
-                return self.OPTIMAL_MIN
-
-            # Cap increases at EXTENDED_MAX during good conditions
+        # Good conditions: keep in optimal/extended range
+        # RTT threshold raised from 150 → 600 to match new RTT bins
+        if avg_throughput > 20 and avg_loss < 0.5 and avg_rtt < 600:
+            if result < self.OPTIMAL_MIN and proposed_connections < current_connections:
+                logger.debug("EdgePolicy: good conditions, floor at OPTIMAL_MIN=%d", self.OPTIMAL_MIN)
+                return max(self.OPTIMAL_MIN, current_connections)
             if result > self.EXTENDED_MAX and proposed_connections > current_connections:
-                logger.debug(
-                    "EdgePolicy: good conditions, capping increase at EXTENDED_MAX=%d",
-                    self.EXTENDED_MAX,
-                )
+                logger.debug("EdgePolicy: good conditions, cap at EXTENDED_MAX=%d", self.EXTENDED_MAX)
                 return min(self.EXTENDED_MAX, result)
 
-        # Poor conditions: limit increases to +1
-        elif avg_loss > 2.0 or avg_rtt > 200:
+        # Poor conditions: limit increases
+        # RTT threshold raised from 200 → 1000 to match new RTT bins
+        if avg_loss > 2.0 or avg_rtt > 1000:
             if proposed_connections > current_connections:
-                logger.debug(
-                    "EdgePolicy: poor conditions (loss=%.2f%%, rtt=%.1f), "
-                    "limiting increase to +1",
-                    avg_loss, avg_rtt,
-                )
+                logger.debug("EdgePolicy: poor conditions, limiting increase to +1")
                 return min(current_connections + 1, result)
 
         return result
 
-    def _load(self):
+    # -----------------------------------------------------------------------
+    # Internal
+    # -----------------------------------------------------------------------
+
+    def _load(self) -> None:
         Q, metadata = self._storage.load()
         if Q:
             self._agent.Q = Q
@@ -220,7 +336,7 @@ class EdgePolicy:
                 self._agent.exploration_rate,
             )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"EdgePolicy("
             f"connections={self.current_connections}, "

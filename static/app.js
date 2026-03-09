@@ -156,6 +156,16 @@ class DownloadManager {
                 const res  = await fetch(`/api/downloads/${id}`);
                 if (!res.ok) continue;
                 const data = await res.json();
+                
+                // Debug logging for stream changes
+                if (info.useRL && data.stream_count !== info.lastStreamCount) {
+                    console.log(`Stream change detected for ${id}:`, {
+                        old: info.lastStreamCount,
+                        new: data.stream_count,
+                        data: data
+                    });
+                }
+                
                 this.updateDownloadUI(id, data, info);
                 if (data.speed) totalSpeed += data.speed;
             } catch (_) {}
@@ -173,7 +183,8 @@ class DownloadManager {
         const status = data.status || 'downloading';
         const pct    = Math.round(data.progress || 0);
         const speed  = data.speed || 0; // Speed in MB/s from backend
-        const streams = data.stream_count || data.current_streams;
+        // Get stream count from either field
+        const streams = data.stream_count || data.current_streams || data.num_streams;
         const totalSize = data.total_size || 0;
         const downloadedSize = data.downloaded_size || 0;
 
@@ -184,7 +195,7 @@ class DownloadManager {
 
         item.querySelector('.dl-pct').textContent = `${pct}%`;
         
-        // FIXED: Display speed in MB/s (no conversion)
+        // Display speed in MB/s
         if (speed > 0) {
             item.querySelector('.dl-spd').textContent = this.fmtSpeedMBps(speed);
         } else {
@@ -203,24 +214,43 @@ class DownloadManager {
             }
         }
 
-        // Update stream count display
+        // Update stream count display with visual feedback
         const streamsElement = item.querySelector('.dl-streams-value');
-        if (streamsElement && streams) {
+        const streamsSpan = item.querySelector('.dl-streams');
+        
+        if (streamsElement && streams !== undefined) {
+            // Store previous value for comparison
+            const prevStreams = info.lastStreamCount;
+            
+            // Update display
             streamsElement.textContent = streams;
             
             // Show/hide based on mode
-            const streamsSpan = item.querySelector('.dl-streams');
             if (streamsSpan) {
                 streamsSpan.style.display = info.mode === 'single' ? 'none' : 'inline-flex';
             }
             
-            // Add visual indicator for stream changes
-            if (info.lastStreamCount && info.lastStreamCount !== streams) {
+            // Add visual indicator for stream changes with animation
+            if (prevStreams && prevStreams !== streams) {
+                // Flash the stream count
                 streamsElement.style.color = 'var(--green)';
+                streamsElement.style.fontWeight = 'bold';
+                
+                // Add a temporary "changed" class for animation
+                streamsSpan?.classList.add('stream-changed');
+                
                 setTimeout(() => {
                     streamsElement.style.color = '';
-                }, 1000);
+                    streamsElement.style.fontWeight = '';
+                    streamsSpan?.classList.remove('stream-changed');
+                }, 1500);
+                
+                // Log the change for debugging
+                console.log(`Stream changed for ${id}: ${prevStreams} → ${streams}`);
             }
+            
+            // Update the info object
+            info.lastStreamCount = streams;
         }
 
         // Status line
@@ -239,7 +269,7 @@ class DownloadManager {
         // Border colour
         item.className = `download-item ${status}`;
 
-        // RL row
+        // RL row with better visualization
         if (info.useRL && streams) {
             let rlRow = item.querySelector('.dl-rl-row');
             if (!rlRow) {
@@ -247,21 +277,47 @@ class DownloadManager {
                 rlRow.className = 'dl-rl-row';
                 item.appendChild(rlRow);
             }
+            
+            // Check if stream count changed
             const changed = info.lastStreamCount !== null && info.lastStreamCount !== streams;
-            let decision = streams > (info.lastStreamCount||streams) ? `↑ ${streams}` :
-                           streams < (info.lastStreamCount||streams) ? `↓ ${streams}` : `= ${streams}`;
+            
+            // Create decision message
+            let decision = '';
+            let arrow = '';
             if (changed) {
-                info.decisionHistory.unshift(`${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}: ${decision} streams`);
+                if (streams > info.lastStreamCount) {
+                    arrow = '↑';
+                    decision = `Increased to ${streams}`;
+                } else if (streams < info.lastStreamCount) {
+                    arrow = '↓';
+                    decision = `Decreased to ${streams}`;
+                }
+                
+                // Add to history
+                info.decisionHistory.unshift(
+                    `${new Date().toLocaleTimeString()}: ${arrow} ${streams} streams`
+                );
                 if (info.decisionHistory.length > 3) info.decisionHistory.pop();
             }
-            info.lastStreamCount = streams;
-
+            
+            // Update RL row with animation class if changed
+            rlRow.className = `dl-rl-row ${changed ? 'rl-changed' : ''}`;
+            
             rlRow.innerHTML = `
                 <i class="fas fa-robot"></i>
                 <span>AI-managed</span>
-                <span class="dl-rl-streams">${streams} streams</span>
-                <span class="dl-rl-history">${info.decisionHistory[0] || ''}</span>
+                <span class="dl-rl-streams ${changed ? 'stream-updated' : ''}">
+                    ${streams} streams ${changed ? arrow : ''}
+                </span>
+                <span class="dl-rl-history">${info.decisionHistory[0] || 'Monitoring...'}</span>
             `;
+            
+            // Remove animation class after delay
+            if (changed) {
+                setTimeout(() => {
+                    rlRow.classList.remove('rl-changed');
+                }, 2000);
+            }
         }
 
         // Move to history on terminal state
@@ -476,7 +532,7 @@ class DownloadManager {
             ? `<i class="fas fa-circle" style="color:var(--green)"></i> ${active.length} downloading`
             : `<i class="fas fa-circle" style="color:var(--text3)"></i> Idle`;
 
-        // Show total speed in MB/s (remove the * 8 conversion)
+        // Show total speed in MB/s
         document.getElementById('sbSpeedText').textContent =
             totalSpeedMBps > 0 ? this.fmtSpeedMBps(totalSpeedMBps) : '0 MB/s';
         
@@ -514,7 +570,7 @@ class DownloadManager {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + units[i];
     }
 
-    // FIXED: Format speed in MB/s (MegaBytes per second)
+    // Format speed in MB/s
     fmtSpeedMBps(speedMBps) {
         if (speedMBps >= 1000) {
             return `${(speedMBps/1000).toFixed(2)} GB/s`;
