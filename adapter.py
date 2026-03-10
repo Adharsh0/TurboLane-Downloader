@@ -1,4 +1,3 @@
-
 """
 adapter.py
 
@@ -30,9 +29,9 @@ class TurboLaneAdapter:
             max_connections=max_connections,
             default_connections=default_connections,
             monitoring_interval=monitoring_interval,
-            exploration_rate=0.2,        # lower initial exploration
-            exploration_decay=0.98,      # decay faster
-            min_exploration=0.05,
+            exploration_rate=0.3,        # higher — needs to explore to escape bad policy
+            exploration_decay=0.999,     # very slow decay — keep exploring longer
+            min_exploration=0.15,        # never drop below 15% exploration
         )
         logger.info(
             "TurboLaneAdapter ready: connections=[%d..%d] default=%d",

@@ -2,24 +2,6 @@
 turbolane/policies/edge.py
 
 EdgePolicy — the policy wrapper for edge / public internet environments.
-
-Responsibilities:
-- Own the RLAgent instance
-- Own the QTableStorage instance
-- Expose a clean, stable interface to the engine
-- Handle persistence (auto-save, load on init)
-- Apply edge-specific action constraints (optimal stream range for HTTP downloads)
-
-Design principles:
-- No networking code
-- No application logic
-- Agent-type-agnostic interface (same methods regardless of Q-learning or PPO)
-
-Edge vs DCI differences:
-- Finer throughput discretization (6 bins vs 5) for typical HTTP download speeds
-- Optimal stream range awareness (6–10 streams for public CDN downloads)
-- Action constraints tuned for high-RTT, variable-loss public internet conditions
-- Progressive stream cost in reward to discourage unnecessary connections
 """
 
 import logging
@@ -41,17 +23,14 @@ class EdgePolicy:
         save()                                          (persist to disk)
         get_stats()                              → dict
         reset()                                         (clear learned state)
-
-    All methods have identical signatures regardless of whether
-    the backend is Q-learning or PPO — future migration is transparent.
     """
 
-    # Optimal stream range for public internet HTTP downloads
-    OPTIMAL_MIN = 6
-    OPTIMAL_MAX = 10
-    OPTIMAL_BONUS = 12.0
-    EXTENDED_MAX = 12
-    EXTENDED_BONUS = 5.0
+    # Optimal stream range — tuned for good connections (low RTT, low loss)
+    OPTIMAL_MIN = 8        # was 6 — floor raised for better throughput
+    OPTIMAL_MAX = 16       # was 10 — allow full 16 streams on good connections
+    OPTIMAL_BONUS = 20.0   # was 12.0 — stronger incentive to stay high
+    EXTENDED_MAX = 16      # was 12
+    EXTENDED_BONUS = 10.0  # was 5.0
 
     def __init__(
         self,
@@ -160,14 +139,8 @@ class EdgePolicy:
         Edge-tuned state discretization.
 
         Throughput bins (Mbps): 0-10, 10-20, 20-30, 30-40, 40-50, 50+
-            6 bins — public CDN speeds cluster in the 10-50 Mbps range.
         RTT bins (ms): 0-50, 50-150, 150-300, 300-600, 600-1000, 1000+
-            6 bins — extended range covers real-world high-latency connections.
-            Previous 4-bin version capped at 150ms, causing all high-RTT
-            connections to collapse into the same state and preventing
-            Q-table growth.
         Loss bins (%): 0-0.1, 0.1-0.5, 0.5-1.0, 1.0-2.0, 2.0+
-            5 bins — unchanged, loss thresholds are protocol-driven.
 
         Total states: 6 × 6 × 5 = 180
         """
@@ -185,7 +158,7 @@ class EdgePolicy:
         else:
             t = 5
 
-        # RTT level (0-5) — extended to cover real-world high-latency connections
+        # RTT level (0-5)
         if rtt_ms < 50:
             r = 0
         elif rtt_ms < 150:
@@ -222,50 +195,49 @@ class EdgePolicy:
         num_streams: int,
     ) -> float:
         """
-        Edge reward function.
+        Edge reward function — tuned to maximize download speed.
 
-        Components:
-          + throughput improvement (primary signal)
-          − quadratic loss penalty
-          − RTT penalty (congestion signal)
-          − progressive stream cost (discourages unnecessary connections)
-          + optimal range bonus (6-10 streams → strongest incentive)
-          + extended range bonus (10-12 streams → moderate incentive)
+        Changes from previous version:
+        - Loss penalty reduced (0.10-0.30% is normal, not worth penalizing)
+        - RTT penalty threshold raised to 100ms (10ms should have zero penalty)
+        - Added absolute throughput bonus (rewards high speed, not just delta)
+        - Stream penalty removed inside optimal range
+        - Stronger optimal range bonus
         """
-        # Throughput improvement
+        # Throughput improvement delta
         tput_delta = curr_throughput - prev_throughput
 
-        # Quadratic loss penalty
-        loss_penalty = (curr_loss_pct ** 2) * 0.5
+        # Light loss penalty — normal internet loss (< 0.5%) barely penalized
+        loss_penalty = (curr_loss_pct ** 2) * 0.1   # was 0.5
 
-        # RTT congestion penalty — scaled for extended RTT range
-        rtt_penalty = max(0.0, (curr_rtt_ms - 50.0) * 0.005)
+        # RTT penalty only kicks in above 100ms — 10ms RTT = zero penalty
+        rtt_penalty = max(0.0, (curr_rtt_ms - 100.0) * 0.002)  # was 50ms / 0.005
 
-        # Progressive stream overhead
-        if num_streams <= self.OPTIMAL_MIN:
+        # Stream penalty — only outside optimal range
+        if num_streams <= self.OPTIMAL_MAX:
             stream_penalty = 0.0
-        elif num_streams <= self.OPTIMAL_MAX:
-            stream_penalty = (num_streams - self.OPTIMAL_MIN) * 0.1
-        elif num_streams <= self.EXTENDED_MAX:
-            stream_penalty = (num_streams - self.OPTIMAL_MAX) * 0.5 + 0.4
         else:
-            stream_penalty = (num_streams - self.EXTENDED_MAX) * 1.5 + 1.4
+            stream_penalty = (num_streams - self.OPTIMAL_MAX) * 0.2
+
+        # Absolute throughput bonus — rewards staying at high speed
+        throughput_bonus = min(3.0, curr_throughput * 0.05)
 
         # Efficiency bonus: throughput per stream
         efficiency = curr_throughput / max(1, num_streams)
         efficiency_bonus = min(2.0, efficiency * 0.1) if efficiency > 4.0 else 0.0
 
         reward = (
-            tput_delta * 0.1
+            tput_delta * 0.2          # was 0.1
+            + throughput_bonus        # new
             + efficiency_bonus
             - loss_penalty
             - rtt_penalty
             - stream_penalty
         )
 
-        # Optimal range bonus
+        # Strong bonus for staying in optimal range
         if self.OPTIMAL_MIN <= num_streams <= self.OPTIMAL_MAX:
-            reward += self.OPTIMAL_BONUS * 0.1
+            reward += self.OPTIMAL_BONUS * 0.15   # was 0.1
         elif num_streams <= self.EXTENDED_MAX:
             reward += self.EXTENDED_BONUS * 0.1
 
@@ -280,10 +252,8 @@ class EdgePolicy:
         """
         Edge-specific action constraints.
 
-        Guards:
-        - Good conditions  → don't drop below OPTIMAL_MIN
-        - Good conditions  → cap at EXTENDED_MAX
-        - Poor conditions  → limit increases to +1
+        Key change: hard floor at OPTIMAL_MIN on good connections —
+        agent can never drop below 8 streams when network is healthy.
         """
         result = max(self._min_connections, min(self._max_connections, proposed_connections))
 
@@ -294,18 +264,13 @@ class EdgePolicy:
         avg_loss = sum(m["loss"] for m in recent_metrics) / len(recent_metrics)
         avg_rtt = sum(m["rtt"] for m in recent_metrics) / len(recent_metrics)
 
-        # Good conditions: keep in optimal/extended range
-        # RTT threshold raised from 150 → 600 to match new RTT bins
-        if avg_throughput > 20 and avg_loss < 0.5 and avg_rtt < 600:
-            if result < self.OPTIMAL_MIN and proposed_connections < current_connections:
-                logger.debug("EdgePolicy: good conditions, floor at OPTIMAL_MIN=%d", self.OPTIMAL_MIN)
-                return max(self.OPTIMAL_MIN, current_connections)
-            if result > self.EXTENDED_MAX and proposed_connections > current_connections:
-                logger.debug("EdgePolicy: good conditions, cap at EXTENDED_MAX=%d", self.EXTENDED_MAX)
-                return min(self.EXTENDED_MAX, result)
+        # Good conditions — hard floor at OPTIMAL_MIN, never drop below it
+        if avg_throughput > 5 and avg_loss < 1.0 and avg_rtt < 200:
+            if result < self.OPTIMAL_MIN:
+                logger.debug("EdgePolicy: good conditions, hard floor at OPTIMAL_MIN=%d", self.OPTIMAL_MIN)
+                return self.OPTIMAL_MIN
 
-        # Poor conditions: limit increases
-        # RTT threshold raised from 200 → 1000 to match new RTT bins
+        # Poor conditions: limit increases to +1 at a time
         if avg_loss > 2.0 or avg_rtt > 1000:
             if proposed_connections > current_connections:
                 logger.debug("EdgePolicy: poor conditions, limiting increase to +1")
@@ -321,18 +286,30 @@ class EdgePolicy:
         Q, metadata = self._storage.load()
         if Q:
             self._agent.Q = Q
+
+            # Restore exploration rate
             saved_epsilon = metadata.get("exploration_rate")
             if saved_epsilon is not None:
                 self._agent.exploration_rate = max(
                     self._agent.min_exploration,
                     float(saved_epsilon),
                 )
+
+            # Restore decision/update counters
             self._agent.total_decisions = int(metadata.get("total_decisions", 0))
             self._agent.total_updates = int(metadata.get("total_updates", 0))
+
+            # Restore reward stats
+            self._agent._total_reward = float(metadata.get("total_reward", 0.0))
+            self._agent._positive_rewards = int(metadata.get("positive_rewards", 0))
+            self._agent._negative_rewards = int(metadata.get("negative_rewards", 0))
+            self._agent._throughput_improvements = int(metadata.get("throughput_improvements", 0))
+
             logger.info(
-                "EdgePolicy restored: %d Q-states, %d decisions, ε=%.4f",
+                "EdgePolicy restored: %d Q-states, %d decisions, %d updates, ε=%.4f",
                 len(Q),
                 self._agent.total_decisions,
+                self._agent.total_updates,
                 self._agent.exploration_rate,
             )
 

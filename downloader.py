@@ -75,6 +75,10 @@ class MultiStreamDownloader:
         self.failed_chunks = set()
         self.active_chunks = set()
 
+        # Connection reset tracking — used to signal server overload to RL
+        self._connection_resets = 0
+        self._connection_resets_since_last_mi = 0
+
         # Network metrics (updated each monitoring interval)
         self.network_metrics = {
             "throughput": 0.0,
@@ -83,6 +87,11 @@ class MultiStreamDownloader:
             "last_update": time.time(),
         }
         self._last_packet_loss = 0.1
+
+        # Throughput tracking — rolling window for accurate measurement
+        self._throughput_window = []        # list of (timestamp, bytes) samples
+        self._throughput_window_size = 10   # keep last 10 samples
+        self._last_speed_mbps = 0.0
 
         # Monitoring interval tracking
         self._last_mi_time = time.time()
@@ -126,41 +135,89 @@ class MultiStreamDownloader:
         return min(1000.0, max(10.0, min_gap * 1000))
 
     def _estimate_packet_loss(self) -> float:
-        if not self.chunk_speeds or len(self.chunk_speeds) < 3:
-            return 0.1
-
-        recent_speeds = list(self.chunk_speeds.values())[-5:]
-        avg_speed = sum(recent_speeds) / len(recent_speeds)
-        if avg_speed < 0.1:
-            return 1.0
-
-        variance = sum((s - avg_speed) ** 2 for s in recent_speeds) / len(recent_speeds)
-        cv = (variance ** 0.5) / avg_speed
-
+        """
+        Estimate packet loss using:
+        1. Connection reset rate — most reliable signal
+        2. Chunk failure rate
+        3. Speed variance (fallback)
+        """
         total = len(self.chunks)
         failed = len(self.failed_chunks)
         failure_rate = failed / total if total > 0 else 0
 
-        loss_from_variance = min(1.0, cv * 2.0)
+        # Connection resets since last MI are a strong signal of server overload
+        reset_penalty = min(3.0, self._connection_resets_since_last_mi * 0.5)
+
+        # Chunk failure contribution
         loss_from_failures = min(3.0, failure_rate * 15.0)
 
-        estimated = loss_from_variance * 0.3 + loss_from_failures * 0.7
+        # Speed variance contribution (minor)
+        loss_from_variance = 0.0
+        if self.chunk_speeds and len(self.chunk_speeds) >= 3:
+            recent_speeds = list(self.chunk_speeds.values())[-5:]
+            avg_speed = sum(recent_speeds) / len(recent_speeds)
+            if avg_speed > 0.1:
+                variance = sum((s - avg_speed) ** 2 for s in recent_speeds) / len(recent_speeds)
+                cv = (variance ** 0.5) / avg_speed
+                loss_from_variance = min(1.0, cv * 1.0)  # reduced from 2.0
+
+        estimated = (
+            reset_penalty * 0.5
+            + loss_from_failures * 0.3
+            + loss_from_variance * 0.2
+        )
+
         smoothed = 0.7 * self._last_packet_loss + 0.3 * estimated
         self._last_packet_loss = smoothed
+
+        # Reset per-interval counter
+        self._connection_resets_since_last_mi = 0
+
         return max(0.1, min(5.0, smoothed))
 
-    def calculate_throughput(self) -> float:
+    def _add_throughput_sample(self):
+        """Add a throughput sample to the rolling window."""
         now = time.time()
-        elapsed = now - self._last_mi_time
-        if elapsed < 0.1:
-            # Fall back to total average on first call
+        with self.lock:
+            bytes_now = self.downloaded_bytes
+        self._throughput_window.append((now, bytes_now))
+        # Keep only last N samples
+        if len(self._throughput_window) > self._throughput_window_size:
+            self._throughput_window.pop(0)
+
+    def calculate_throughput(self) -> float:
+        """
+        Calculate total download throughput in Mbps using a rolling window.
+        This measures ALL bytes across ALL streams — not per-stream.
+        """
+        self._add_throughput_sample()
+
+        if len(self._throughput_window) < 2:
+            # Not enough samples — fall back to total average
             if self.start_time and self.downloaded_bytes > 0:
-                total_elapsed = now - self.start_time
+                total_elapsed = time.time() - self.start_time
                 if total_elapsed > 0.1:
-                    return (self.downloaded_bytes * 8) / (total_elapsed * 1024 * 1024)
+                    speed = (self.downloaded_bytes * 8) / (total_elapsed * 1024 * 1024)
+                    self._last_speed_mbps = speed
+                    return speed
             return 0.0
-        bytes_delta = self.downloaded_bytes - self._last_mi_bytes
-        return (bytes_delta * 8) / (elapsed * 1024 * 1024)  # Mbps
+
+        # Use oldest and newest sample in window for stable measurement
+        oldest_time, oldest_bytes = self._throughput_window[0]
+        newest_time, newest_bytes = self._throughput_window[-1]
+
+        elapsed = newest_time - oldest_time
+        if elapsed < 0.1:
+            return self._last_speed_mbps
+
+        bytes_delta = newest_bytes - oldest_bytes
+        if bytes_delta < 0:
+            return self._last_speed_mbps
+
+        # Convert to Mbps (megabits per second)
+        speed_mbps = (bytes_delta * 8) / (elapsed * 1024 * 1024)
+        self._last_speed_mbps = speed_mbps
+        return speed_mbps
 
     def get_speed(self) -> float:
         """Return current speed in MB/s."""
@@ -200,7 +257,7 @@ class MultiStreamDownloader:
     def _run_monitoring_interval(self) -> None:
         """
         One monitoring interval cycle:
-          1. Measure network state
+          1. Measure network state (total throughput across all streams)
           2. Tell engine what happened (learn)
           3. Ask engine what to do next (decide)
           4. Apply the decision
@@ -341,6 +398,17 @@ class MultiStreamDownloader:
             with self.lock:
                 self.failed_chunks.add(chunk_id)
                 self.active_chunks.discard(chunk_id)
+                # Track connection resets specifically — signals server overload to RL
+                error_str = str(e).lower()
+                if "connection" in error_str and (
+                    "reset" in error_str or "aborted" in error_str or "closed" in error_str
+                ):
+                    self._connection_resets += 1
+                    self._connection_resets_since_last_mi += 1
+                    logger.debug(
+                        "Connection reset on chunk %d (total resets: %d)",
+                        chunk_id, self._connection_resets
+                    )
             if os.path.exists(temp_file):
                 try:
                     os.remove(temp_file)
@@ -373,6 +441,7 @@ class MultiStreamDownloader:
         self.downloaded_bytes = 0
         self.start_time = time.time()
         self._last_mi_time = self.start_time
+        self._throughput_window = []
         self.threads, self.temp_files = [], []
 
         self.chunks = self._calculate_chunks(self.file_size, MAX_STREAMS)
@@ -401,8 +470,9 @@ class MultiStreamDownloader:
                     progress = (self.downloaded_bytes / self.file_size) * 100
                     logger.info(
                         "Progress: %.1f%% | Active: %d | Speed: %.1f Mbps | Streams: %d",
-                        progress, len(self.active_chunks), self.calculate_throughput(),
-                        self.current_stream_count
+                        progress, len(self.active_chunks),
+                        self.calculate_throughput(),
+                        self.current_stream_count,
                     )
                 last_progress_log = time.time()
 
@@ -483,12 +553,6 @@ class MultiStreamDownloader:
     # -----------------------------------------------------------------------
 
     def download(self, output_path: str = None) -> str | None:
-        """
-        Download the file.
-
-        Returns:
-            Path to downloaded file on success, None on failure.
-        """
         try:
             supports_ranges, file_size, filename = self.check_download_support()
             self.file_size = file_size
@@ -543,6 +607,7 @@ class MultiStreamDownloader:
             "completed_chunks": len(self.chunk_end_times),
             "failed_chunks": len(self.failed_chunks),
             "active_chunks": len(self.active_chunks),
+            "connection_resets": self._connection_resets,
         }
         if self.use_rl:
             stats["rl_stats"] = adapter.get_stats()

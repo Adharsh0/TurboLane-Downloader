@@ -81,6 +81,7 @@ class RLAgent:
         # Monitoring interval
         self.monitoring_interval = monitoring_interval
         self._last_decision_time: float = 0.0
+        self._last_learn_time: float = 0.0
 
         # Injected policy functions (with sensible defaults)
         self._discretize = discretize_fn or self._default_discretize
@@ -94,6 +95,7 @@ class RLAgent:
         self._last_state: tuple | None = None
         self._last_action: int | None = None
         self._last_metrics: dict | None = None
+        self._learn_pending: bool = False
 
         # Rolling history
         self._action_history: deque = deque(maxlen=10)
@@ -126,10 +128,10 @@ class RLAgent:
 
     def _default_reward(self, prev_t, curr_t, loss, rtt, streams) -> float:
         tput_delta = curr_t - prev_t
-        loss_penalty = (loss ** 2) * 0.5
-        rtt_penalty = max(0.0, (rtt - 50.0) * 0.01)
-        stream_penalty = 0.0 if streams <= 4 else (streams - 4) * 0.05
-        return max(-5.0, min(5.0, tput_delta * 0.1 - loss_penalty - rtt_penalty - stream_penalty))
+        loss_penalty = (loss ** 2) * 0.1
+        rtt_penalty = max(0.0, (rtt - 100.0) * 0.002)
+        stream_penalty = 0.0 if streams <= 8 else (streams - 8) * 0.1
+        return max(-5.0, min(5.0, tput_delta * 0.2 - loss_penalty - rtt_penalty - stream_penalty))
 
     def _default_constrain(self, proposed, current, recent_metrics) -> int:
         return max(self.min_connections, min(self.max_connections, proposed))
@@ -157,7 +159,7 @@ class RLAgent:
     def _max_q(self, state: tuple) -> float:
         # Don't call _init_state here — only peek if state already exists
         if state not in self.Q:
-            return 0.0   # ← return 0 for unseen states instead of creating them
+            return 0.0
         return max(self.Q[state].values())
 
     # -----------------------------------------------------------------------
@@ -173,13 +175,18 @@ class RLAgent:
 
         visit_count = sum(1 for m in self._metrics_history if m.get("state") == state)
         effective_epsilon = (
-            min(0.6, self.exploration_rate * 2.0)
-            if visit_count < 3
+            min(0.8, self.exploration_rate * 2.0)   # boosted from 0.6 → 0.8
+            if visit_count < 5                       # extended from 3 → 5 visits
             else self.exploration_rate
         )
 
         if random.random() < effective_epsilon:
-            return random.randrange(NUM_ACTIONS)
+            # Bias random exploration toward increase actions (0, 1) on good connections
+            return random.choices(
+                population=[0, 1, 2, 3, 4],
+                weights=[3, 3, 2, 1, 1],   # 60% chance of increase/hold, 40% decrease
+                k=1
+            )[0]
 
         best = self._best_action(state)
 
@@ -256,6 +263,7 @@ class RLAgent:
 
         self.current_connections = new_connections
         self._last_decision_time = time.monotonic()
+        self._learn_pending = True
         self.total_decisions += 1
         self._action_history.append(action)
 
@@ -277,8 +285,23 @@ class RLAgent:
         rtt_ms: float,
         loss_pct: float,
     ) -> None:
-        """Update Q-table using outcome of the previous decision."""
-        if self._last_state is None or self._last_action is None:
+        """Update Q-table using outcome of the previous decision.
+
+        Gated so it only fires once per decision cycle — rapid calls
+        between decisions are ignored to prevent multiple Q-updates
+        for a single action.
+        """
+        now = time.monotonic()
+
+        # Gate: only allow one learn per monitoring interval
+        if (now - self._last_learn_time) < self.monitoring_interval:
+            return
+
+        # Gate: only learn if a decision was actually made since last learn
+        if not self._learn_pending:
+            return
+
+        if self._last_state is None or self._last_action is None or self._last_metrics is None:
             self._last_metrics = {
                 "throughput": throughput_mbps,
                 "rtt": rtt_ms,
@@ -318,6 +341,13 @@ class RLAgent:
             "connections": self.current_connections,
         })
 
+        # Reset transition memory after learn — prevents cross-download contamination
+        self._last_state = None
+        self._last_action = None
+        self._last_metrics = None
+        self._learn_pending = False
+        self._last_learn_time = now
+
     # -----------------------------------------------------------------------
     # Stats and reset
     # -----------------------------------------------------------------------
@@ -327,7 +357,7 @@ class RLAgent:
         q_states = len(self.Q)
         return {
             "q_table_states": q_states,
-            "q_table_size": q_states,          # ← ADD THIS LINE (UI reads this key)
+            "q_table_size": q_states,
             "current_connections": self.current_connections,
             "exploration_rate": round(self.exploration_rate, 4),
             "total_decisions": self.total_decisions,
@@ -338,7 +368,7 @@ class RLAgent:
             "negative_rewards": self._negative_rewards,
             "throughput_improvements": self._throughput_improvements,
             "monitoring_interval": self.monitoring_interval,
-    }
+        }
 
     def reset(self) -> None:
         """Clear all learned state."""
@@ -346,6 +376,8 @@ class RLAgent:
         self._last_state = None
         self._last_action = None
         self._last_metrics = None
+        self._learn_pending = False
+        self._last_learn_time = 0.0
         self._action_history.clear()
         self._metrics_history.clear()
         self.total_decisions = 0
