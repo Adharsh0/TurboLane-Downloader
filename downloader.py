@@ -113,10 +113,17 @@ class MultiStreamDownloader:
         """Measure RTT via ping, fall back to chunk-based estimate."""
         try:
             hostname = urlparse(self.url).hostname
-            param = "-n" if platform.system().lower() == "windows" else "-c"
+            is_windows = platform.system().lower() == "windows"
+            param = "-n" if is_windows else "-c"
+            # On Windows, CREATE_NO_WINDOW prevents a terminal from flashing
+            # each time ping is called (important when running as a compiled exe)
+            kwargs = {}
+            if is_windows:
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             result = subprocess.run(
                 ["ping", param, "1", "-W", "2", hostname],
                 capture_output=True, text=True, timeout=3,
+                **kwargs,
             )
             output = result.stdout.lower()
             if "time=" in output:
